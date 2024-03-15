@@ -47,6 +47,14 @@ struct {
 
 static struct data_x empty_dummy = {};
 
+// Declare scratchpad for a buffer (one object per CPU)
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10000);
+    __type(key, u64);
+    __type(value, u64);
+} file_write_cache SEC(".maps");
+
 static __always_inline struct data_x *__get_buffer(u32 index)
 {
     // hack to hopefully reset the data to zero
@@ -217,7 +225,6 @@ static long __store_path(struct bpf_map *map, const void *key, void *_value, voi
 	bpf_probe_read(buffer, 1, "/");
 
 	// Copy in the path without the trailing NULL
-	len -= 1;
 	len &= 0x1ff;
 	bpf_probe_read(&(buffer[1]), len, path_data->name);
 
@@ -416,6 +423,10 @@ int BPF_PROG(on_security_file_open, struct file *file)
 			return 0;
 		}
 
+		// Update the cache entry to say that we care about
+    	u64 file_cache_key = (u64)file;
+		bpf_map_update_elem(&file_write_cache, &file_cache_key, &file_cache_key, BPF_ANY);
+
 		// We need to walk the dentry back to the root node to collect the path
 		//  We also need to account for the mount point in this case because it may not be the root
 		//  This will end up looping twice and copying the path name twice.
@@ -430,6 +441,44 @@ int BPF_PROG(on_security_file_open, struct file *file)
 		{
 			bpf_printk("create: pid = %d, filename = %s, length = %d", pid, data_x->buffer, buffer_size);
 		}
+	}
+
+	return 0;
+}
+
+SEC("fentry/security_file_free")
+int BPF_PROG(on_security_file_free, struct file *file)
+{
+	// bpf_printk("on_security_file_free: enter");
+    struct data_x *data_x = NULL;
+    u16 buffer_size;
+
+
+    u64 file_cache_key = (u64)file;
+	void *cachep = bpf_map_lookup_elem(&file_write_cache, &file_cache_key);
+	if (cachep)
+	{
+		// bpf_printk("on_security_file_free: closed file we reported write");
+
+		// bpf_printk("on_security_file_open: do_work");
+		pid_t pid = bpf_get_current_pid_tgid() >> 32;
+
+		// Get a buffer to store the path
+		data_x = __get_buffer(0);
+		if (!data_x) {
+			return 0;
+		}
+
+		// We need to walk the dentry back to the root node to collect the path
+		//  We also need to account for the mount point in this case because it may not be the root
+		//  This will end up looping twice and copying the path name twice.
+		//  This is unfortunate but needed since there is no strlen 
+		buffer_size = __do_file_path(BPF_CORE_READ(file, f_path.dentry), BPF_CORE_READ(file, f_path.mnt), data_x);
+
+		bpf_printk("close: pid = %d, filename = %s, length = %d", pid, data_x->buffer, buffer_size);
+
+		// delete the cached item now that we are done with it
+    	bpf_map_delete_elem(&file_write_cache, &file_cache_key);
 	}
 
 	return 0;
